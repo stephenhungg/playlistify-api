@@ -1,0 +1,365 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  AWS_REGION: us-west-2
+  EKS_CLUSTER_NAME: playlistify-cluster
+  ECR_REPOSITORY: playlistify-api
+  HELM_CHART_PATH: ./helm/playlistify-api
+
+jobs:
+  # Code Quality and Testing
+  test:
+    name: Test and Lint
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Run linting
+      run: npm run lint
+    
+    - name: Run type checking
+      run: npx tsc --noEmit
+    
+    - name: Run tests
+      run: npm test
+      env:
+        CI: true
+    
+    - name: Generate test coverage
+      run: npm run coverage
+    
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage/lcov.info
+        flags: unittests
+        name: codecov-umbrella
+
+  # Security Scanning
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+    
+    - name: Upload Trivy scan results to GitHub Security tab
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+    
+    - name: Run npm audit
+      run: npm audit --audit-level moderate
+
+  # Build and Push Docker Image
+  build:
+    name: Build and Push Image
+    runs-on: ubuntu-latest
+    needs: [test, security]
+    if: github.event_name == 'push'
+    
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+    
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+    
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Build and push Docker image
+      id: build
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        platforms: linux/amd64
+    
+    - name: Generate SBOM
+      uses: anchore/sbom-action@v0
+      with:
+        image: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+        output-file: sbom.spdx.json
+        format: spdx-json
+    
+    - name: Scan image for vulnerabilities
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+        format: 'sarif'
+        output: 'image-trivy-results.sarif'
+    
+    - name: Upload image scan results
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'image-trivy-results.sarif'
+
+  # Deploy to Development
+  deploy-dev:
+    name: Deploy to Development
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: github.ref == 'refs/heads/develop'
+    environment: development
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+    
+    - name: Setup kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+    
+    - name: Setup Helm
+      uses: azure/setup-helm@v3
+      with:
+        version: '3.12.0'
+    
+    - name: Update kubeconfig
+      run: |
+        aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.EKS_CLUSTER_NAME }}
+    
+    - name: Deploy with Helm
+      run: |
+        helm upgrade --install playlistify-api-dev ${{ env.HELM_CHART_PATH }} \
+          --namespace playlistify-dev \
+          --create-namespace \
+          --set image.tag=${{ github.sha }} \
+          --set image.registry=${{ needs.build.outputs.registry }} \
+          --set ingress.hosts[0].host=api-dev.playlistify.example.com \
+          --set env.secrets.SPOTIFY_CLIENT_ID=${{ secrets.SPOTIFY_CLIENT_ID }} \
+          --set env.secrets.SPOTIFY_CLIENT_SECRET=${{ secrets.SPOTIFY_CLIENT_SECRET }} \
+          --wait --timeout=300s
+    
+    - name: Run smoke tests
+      run: |
+        kubectl wait --for=condition=available --timeout=300s deployment/playlistify-api-dev -n playlistify-dev
+        # Add your smoke test commands here
+
+  # Deploy to Staging
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [deploy-dev]
+    if: github.ref == 'refs/heads/main'
+    environment: staging
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+    
+    - name: Setup kubectl
+      uses: azure/setup-kubectl@v3
+    
+    - name: Setup Helm
+      uses: azure/setup-helm@v3
+    
+    - name: Update kubeconfig
+      run: |
+        aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.EKS_CLUSTER_NAME }}
+    
+    - name: Deploy with Helm
+      run: |
+        helm upgrade --install playlistify-api-staging ${{ env.HELM_CHART_PATH }} \
+          --namespace playlistify-staging \
+          --create-namespace \
+          --set image.tag=${{ github.sha }} \
+          --set replicaCount=2 \
+          --set ingress.hosts[0].host=api-staging.playlistify.example.com \
+          --set env.secrets.SPOTIFY_CLIENT_ID=${{ secrets.SPOTIFY_CLIENT_ID }} \
+          --set env.secrets.SPOTIFY_CLIENT_SECRET=${{ secrets.SPOTIFY_CLIENT_SECRET }} \
+          --wait --timeout=300s
+    
+    - name: Run integration tests
+      run: |
+        kubectl wait --for=condition=available --timeout=300s deployment/playlistify-api-staging -n playlistify-staging
+        # Add your integration test commands here
+
+  # Deploy to Production
+  deploy-prod:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [deploy-staging]
+    if: startsWith(github.ref, 'refs/tags/v')
+    environment: production
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+    
+    - name: Setup kubectl
+      uses: azure/setup-kubectl@v3
+    
+    - name: Setup Helm
+      uses: azure/setup-helm@v3
+    
+    - name: Update kubeconfig
+      run: |
+        aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.EKS_CLUSTER_NAME }}
+    
+    - name: Create production namespace if not exists
+      run: |
+        kubectl create namespace playlistify --dry-run=client -o yaml | kubectl apply -f -
+    
+    - name: Deploy with Helm
+      run: |
+        helm upgrade --install playlistify-api ${{ env.HELM_CHART_PATH }} \
+          --namespace playlistify \
+          --set image.tag=${{ github.sha }} \
+          --set replicaCount=3 \
+          --set resources.requests.memory=1Gi \
+          --set resources.requests.cpu=500m \
+          --set resources.limits.memory=4Gi \
+          --set resources.limits.cpu=2000m \
+          --set ingress.hosts[0].host=api.playlistify.example.com \
+          --set env.secrets.SPOTIFY_CLIENT_ID=${{ secrets.SPOTIFY_CLIENT_ID }} \
+          --set env.secrets.SPOTIFY_CLIENT_SECRET=${{ secrets.SPOTIFY_CLIENT_SECRET }} \
+          --wait --timeout=600s
+    
+    - name: Verify deployment
+      run: |
+        kubectl wait --for=condition=available --timeout=600s deployment/playlistify-api -n playlistify
+        kubectl get pods -n playlistify
+        kubectl get services -n playlistify
+    
+    - name: Run production health checks
+      run: |
+        # Wait for load balancer to be ready
+        sleep 60
+        
+        # Get the load balancer URL
+        LB_URL=$(kubectl get service playlistify-api -n playlistify -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+        
+        if [ ! -z "$LB_URL" ]; then
+          echo "Testing health endpoint: http://$LB_URL/health"
+          curl -f "http://$LB_URL/health" || exit 1
+        else
+          echo "Load balancer URL not available yet"
+        fi
+    
+    - name: Create GitHub Release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref }}
+        release_name: Release ${{ github.ref }}
+        body: |
+          ## Changes in this Release
+          - Automatic release from tag ${{ github.ref }}
+          - Docker image: ${{ needs.build.outputs.image-tag }}
+          - Deployed to production cluster
+        draft: false
+        prerelease: false
+
+  # Cleanup old images
+  cleanup:
+    name: Cleanup Old Images
+    runs-on: ubuntu-latest
+    needs: [deploy-prod]
+    if: always()
+    
+    steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+    
+    - name: Delete old ECR images
+      run: |
+        # Keep only the last 10 images
+        aws ecr describe-images \
+          --repository-name ${{ env.ECR_REPOSITORY }} \
+          --query 'sort_by(imageDetails,&imageLastPushedDate)[:-10].imageDigest' \
+          --output text | \
+        while read digest; do
+          if [ ! -z "$digest" ]; then
+            echo "Deleting image with digest: $digest"
+            aws ecr batch-delete-image \
+              --repository-name ${{ env.ECR_REPOSITORY }} \
+              --image-ids imageDigest=$digest
+          fi
+        done

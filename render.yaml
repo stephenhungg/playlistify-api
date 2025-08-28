@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: vibechain-api
+    env: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    region: oregon
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 8080
+    healthCheckPath: /health

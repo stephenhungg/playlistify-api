@@ -1,0 +1,14 @@
+# Don't copy these files into Docker container
+node_modules
+npm-debug.log
+dist
+.git
+.gitignore
+README.md
+.env
+.nyc_output
+coverage
+.coverage
+.cache
+.DS_Store
+*.log
