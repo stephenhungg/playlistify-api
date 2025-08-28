@@ -1,7 +1,8 @@
 # VibeChain API Specification
 
 **Version**: 1.0.0  
-**Base URL**: `http://localhost:8080`  
+**Base URL (Local)**: `http://localhost:8080`  
+**Base URL (Production)**: `https://vibechain-psi.vercel.app/api`  
 **Content-Type**: `application/json`
 
 ---
@@ -18,20 +19,20 @@ VibeChain is a neural network-powered music recommendation API that predicts the
 
 ### **1. Health Check**
 
-**GET** `/health`
+**GET** `/health` (local) or `/api/health` (production)
 
 Check if the API is running and model is loaded.
+
+**Local URL**: `http://localhost:8080/health`  
+**Production URL**: `https://vibechain-psi.vercel.app/api/health`
 
 **Response:**
 ```json
 {
   "status": "healthy",
   "model_loaded": true,
-  "uptime_seconds": 123.45,
-  "memory_usage": {
-    "used": 46517464,
-    "total": 68550656
-  }
+  "timestamp": "2025-08-28T07:49:14.845Z",
+  "vercel_deployment": true
 }
 ```
 
@@ -43,9 +44,12 @@ Check if the API is running and model is loaded.
 
 ### **2. Analyze Tracks (Main Endpoint)**
 
-**POST** `/analyze`
+**POST** `/analyze` (local) or `/api/analyze` (production)
 
 Get music recommendations based on track features.
+
+**Local URL**: `http://localhost:8080/analyze`  
+**Production URL**: `https://vibechain-psi.vercel.app/api/analyze`
 
 **Request Body:**
 ```json
@@ -121,9 +125,13 @@ Get music recommendations based on track features.
 
 ### **3. Model Information**
 
-**GET** `/model/info`
+**Note**: This endpoint is currently only available in local development.
+
+**GET** `/model/info` (local only)
 
 Get information about the loaded model.
+
+**Local URL**: `http://localhost:8080/model/info`
 
 **Response:**
 ```json
@@ -194,7 +202,10 @@ All values must be normalized to 0-1 range:
 
 ### **JavaScript/Fetch**
 ```javascript
-const response = await fetch('http://localhost:8080/analyze', {
+// Production URL
+const API_URL = 'https://vibechain-psi.vercel.app/api';
+
+const response = await fetch(`${API_URL}/analyze`, {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({
@@ -213,7 +224,10 @@ if (result.success) {
 ```python
 import requests
 
-response = requests.post('http://localhost:8080/analyze', 
+# Production URL
+API_URL = 'https://vibechain-psi.vercel.app/api'
+
+response = requests.post(f'{API_URL}/analyze', 
     json={'tracks': [track_features]})
 
 if response.json()['success']:
@@ -223,14 +237,25 @@ if response.json()['success']:
 
 ### **cURL**
 ```bash
+# Production
+curl -X POST https://vibechain-psi.vercel.app/api/analyze \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tracks": [{
+      "danceability": 0.8,
+      "energy": 0.9,
+      "valence": 0.7
+    }]
+  }'
+
+# Local development  
 curl -X POST http://localhost:8080/analyze \
   -H "Content-Type: application/json" \
   -d '{
     "tracks": [{
       "danceability": 0.8,
       "energy": 0.9,
-      "valence": 0.7,
-      ...
+      "valence": 0.7
     }]
   }'
 ```
@@ -270,10 +295,17 @@ curl -X POST http://localhost:8080/analyze \
 
 ## **⚡ Performance**
 
-- **Response Time**: ~20ms average
+### **Production (Vercel)**
+- **Response Time**: ~15ms average
+- **Cold Start**: ~2-3 seconds (first request after inactivity)
+- **Warm Requests**: Sub-20ms
 - **Throughput**: 1000+ requests/minute
-- **Model Size**: ~500KB
+- **Global CDN**: Low latency worldwide
+
+### **Local Development**
+- **Response Time**: ~20ms average
 - **Memory Usage**: ~50MB
+- **Model Size**: ~56KB
 
 ---
 
@@ -355,6 +387,31 @@ function estimateFeatures(genre, mood = 'neutral') {
   };
 }
 ```
+
+---
+
+## **🚀 Deployment**
+
+### **Production (Vercel)**
+- **URL**: `https://vibechain-psi.vercel.app/api`
+- **Status**: Live and auto-deploying
+- **Features**: HTTPS, Global CDN, Serverless functions
+- **Cost**: Free tier (generous limits)
+
+### **Local Development**
+```bash
+git clone https://github.com/stephenhungg/playlistify-api.git
+cd playlistify-api
+npm install
+npm run dev
+# API available at http://localhost:8080
+```
+
+### **Deploy Your Own**
+1. Fork the GitHub repo
+2. Connect to Vercel
+3. Auto-deploy on push to main
+4. Get your own `https://your-vibechain.vercel.app/api` URL
 
 ---
 
